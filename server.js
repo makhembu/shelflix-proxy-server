@@ -4,11 +4,6 @@ const fetch = require('node-fetch');
 const app = express();
 const PORT = process.env.PORT || 3000;
 
-const FORWARD_HEADERS = [
-  'content-type', 'content-length', 'cache-control',
-  'etag', 'last-modified', 'accept-ranges', 'content-range',
-];
-
 app.use((req, res, next) => {
   res.setHeader('Access-Control-Allow-Origin', '*');
   res.setHeader('Access-Control-Allow-Methods', 'GET, HEAD, OPTIONS');
@@ -25,17 +20,26 @@ app.get(['/', '/proxy'], async (req, res) => {
   }
 
   try {
-    const rawUrl = req.query.url;
-    // rawUrl is decoded once by Express from the outer query param.
-    // URL constructor handles %7B/%22 etc fine — do NOT decodeURIComponent on full URL.
-    const parsedUrl = new URL(rawUrl);
+    const decodedUrl = decodeURIComponent(targetUrl);
 
-    // Parse headers from URL params
+    let streamUrl = decodedUrl;
     let customHeaders = {};
-    const headersParam = parsedUrl.searchParams.get('headers');
-    if (headersParam) {
-      try { customHeaders = JSON.parse(decodeURIComponent(headersParam)); } catch {}
+    let hostOverride = '';
+
+    const headersMatch = decodedUrl.match(/^(.+?)\?headers=({[^}]+})/);
+    if (headersMatch) {
+      streamUrl = headersMatch[1];
+      try {
+        customHeaders = JSON.parse(decodeURIComponent(headersMatch[2]));
+      } catch {}
     }
+
+    const hostMatch = decodedUrl.match(/[?&]host=([^&]+)/);
+    if (hostMatch) {
+      hostOverride = decodeURIComponent(hostMatch[1]);
+    }
+
+    streamUrl = streamUrl.replace(/\?headers=\{[^}]+\}/, '').replace(/&host=[^&]+/, '');
 
     const requestHeaders = {
       'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36',
@@ -45,12 +49,9 @@ app.get(['/', '/proxy'], async (req, res) => {
 
     if (customHeaders.referer) requestHeaders['Referer'] = customHeaders.referer;
     if (customHeaders.origin) requestHeaders['Origin'] = customHeaders.origin;
-    if (req.headers.range) requestHeaders['Range'] = req.headers.range;
+    if (hostOverride) requestHeaders['Host'] = hostOverride;
 
-    // Remove internal params before fetch
-    parsedUrl.searchParams.delete('headers');
-    parsedUrl.searchParams.delete('host');
-    const streamUrl = parsedUrl.toString();
+    if (req.headers.range) requestHeaders['Range'] = req.headers.range;
 
     const response = await fetch(streamUrl, {
       method: req.method,
@@ -60,36 +61,34 @@ app.get(['/', '/proxy'], async (req, res) => {
 
     const contentType = response.headers.get('content-type') || '';
 
-    // Status code guard — don't try to rewrite error pages
-    if (response.status !== 200 && response.status !== 206 && response.status !== 302 && response.status !== 301) {
-      const errorBody = await response.text();
-      res.setHeader('Content-Type', contentType);
-      return res.status(response.status).send(errorBody);
-    }
-
     if (contentType.includes('vnd.apple.mpegurl') || contentType.includes('x-mpegURL') || streamUrl.includes('.m3u8')) {
       const m3u8Text = await response.text();
       const base = new URL(streamUrl);
       const rewrittenLines = m3u8Text.split('\n').map(line => {
         if (line.startsWith('#') || line.trim() === '') return line;
+
         let absoluteUrl;
-        if (line.match(/^https?:\/\//)) absoluteUrl = line;
-        else if (line.startsWith('/')) absoluteUrl = `${base.origin}${line}`;
-        else {
+        if (line.match(/^https?:\/\//)) {
+          absoluteUrl = line;
+        } else if (line.startsWith('/')) {
+          absoluteUrl = `${base.origin}${line}`;
+        } else {
           const basePath = base.pathname.substring(0, base.pathname.lastIndexOf('/') + 1);
           absoluteUrl = `${base.origin}${basePath}${line}`;
         }
+
         return `/proxy?url=${encodeURIComponent(absoluteUrl)}`;
       });
 
       res.setHeader('Content-Type', 'application/vnd.apple.mpegurl');
+      if (response.headers.get('cache-control')) res.setHeader('Cache-Control', response.headers.get('cache-control'));
       return res.status(response.status).send(rewrittenLines.join('\n'));
     }
 
-    for (const header of FORWARD_HEADERS) {
-      const value = response.headers.get(header);
-      if (value) res.setHeader(header, value);
-    }
+    if (response.headers.get('content-length')) res.setHeader('Content-Length', response.headers.get('content-length'));
+    if (response.headers.get('content-range')) res.setHeader('Content-Range', response.headers.get('content-range'));
+    if (response.headers.get('accept-ranges')) res.setHeader('Accept-Ranges', response.headers.get('accept-ranges'));
+    if (response.headers.get('cache-control')) res.setHeader('Cache-Control', response.headers.get('cache-control'));
     res.setHeader('Content-Type', contentType);
 
     response.body.pipe(res.status(response.status));
